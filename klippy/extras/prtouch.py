@@ -236,6 +236,15 @@ class PRTouchZOffsetWrapper:
         if wait:
             self.obj.toolhead.wait_moves()
 
+    def _get_gcode_position(self) -> List[float]:
+        """Current toolhead position expressed in G-code coordinates.
+
+        G1 moves are interpreted in G-code space, so toolhead.get_position()
+        must never be fed back into _execute_move() while a G-code offset is
+        active.
+        """
+        return list(self.obj.gcode_move.get_status()['gcode_position'])
+
     def _interpolate_linear_z(
         self,
         p1: List[float],
@@ -565,7 +574,7 @@ class PRTouchZOffsetWrapper:
         fallback_values: List[float] = []
         retry_z = float(rdy_pos[2])
 
-        self._execute_move(self.obj.toolhead.get_position()[:2] + [rdy_pos[2]], self.cfg.probe_approach_speed)
+        self._execute_move(self._get_gcode_position()[:2] + [rdy_pos[2]], self.cfg.probe_approach_speed)
         self._execute_move(rdy_pos, self.cfg.probe_xy_travel_speed)
 
         for attempt in range(1, max_times + 1):
@@ -577,12 +586,17 @@ class PRTouchZOffsetWrapper:
                     rdy_pos[:2] + [retry_z], speed_mm, min_dis_mm, min_hold, max_hold, True
                 )
                 if not success:
-                    retry_z = retry_z + PROBE_RETRY_Z_INCREMENT_MM if retry_z == rdy_pos[2] else retry_z
                     retry_needed = True
                     break
                 probe_results.append(measured_z)
 
             if retry_needed or not probe_results:
+                # _probe_step() does not move to rdy_pos itself: start_z is taken
+                # as the current toolhead Z. Raising retry_z without executing the
+                # move offset every following measurement by that amount.
+                if retry_z == rdy_pos[2]:
+                    retry_z = rdy_pos[2] + PROBE_RETRY_Z_INCREMENT_MM
+                    self._execute_move(rdy_pos[:2] + [retry_z], self.cfg.probe_approach_speed)
                 self._log_info('_measure_probe_position: probe failed on attempt %d, retrying' % attempt)
                 continue
 
@@ -643,7 +657,7 @@ class PRTouchZOffsetWrapper:
         z_end: Optional[float] = None
         try:
             safe_z = self.cfg.bed_max_err + 1
-            cur = self.obj.toolhead.get_position()
+            cur = self._get_gcode_position()
             self._execute_move(cur[:2] + [safe_z], self.cfg.probe_xy_travel_speed)
 
             start_pos = [self.cfg.nozzle_clean_start_pos_x, self.cfg.nozzle_clean_start_pos_y, safe_z]
@@ -688,7 +702,7 @@ class PRTouchZOffsetWrapper:
         self._log_info('=== Phase 3: Cleaning execution ===')
         try:
             safe_z = self.cfg.nozzle_clean_safe_z_height
-            cur = self.obj.toolhead.get_position()
+            cur = self._get_gcode_position()
             self._execute_move(cur[:2] + [safe_z], self.cfg.probe_xy_travel_speed)
 
             start_pos = [self.cfg.nozzle_clean_start_pos_x, self.cfg.nozzle_clean_start_pos_y, safe_z]
@@ -832,6 +846,7 @@ class PRTouchZOffsetWrapper:
 
         homing_origin = self.obj.gcode_move.get_status()['homing_origin']
         self._log_array('homing_origin:', homing_origin, len(homing_origin))
+        gcode_z_offset = homing_origin[2]
 
         start_z_offset = self.obj.probe.get_offsets()[2]
         self._log_info('Start z_offset: %.3f' % start_z_offset)
@@ -863,7 +878,14 @@ class PRTouchZOffsetWrapper:
         nozzle_z_offset = self.probe_z_offset(x, y)
         self._log_info('Nozzle z_offset: %.3f' % nozzle_z_offset)
 
-        z_offset = nozzle_z_offset - z_probe[2]
+        # run_single_probe() reports the trigger height in toolhead coordinates,
+        # the nozzle touch is measured in G-code coordinates -> put both in the
+        # same frame before subtracting.
+        nozzle_z_toolhead = nozzle_z_offset + gcode_z_offset
+
+        # z_offset = nozzle height above the bed at the moment the probe triggers
+        #          = trigger height - bed contact height
+        z_offset = z_probe[2] - nozzle_z_toolhead
         self._log_info('Calculated z_offset: %.3f' % z_offset)
 
         z_adjust = start_z_offset - z_offset
@@ -872,8 +894,10 @@ class PRTouchZOffsetWrapper:
         if gcmd.get_int('APPLY_Z_ADJUST', 0) == 1:
             self.obj.gcode.run_script_from_command('SET_GCODE_OFFSET Z_ADJUST=%f MOVE=1' % z_adjust)
 
+        # _finalize_probe_calibration() saves -kin_pos[2], so pass -z_offset to
+        # store the newly measured z_offset (not the relative correction).
         prtouch_result = list(z_probe)
-        prtouch_result[2] = -z_adjust
+        prtouch_result[2] = -z_offset
         self._finalize_probe_calibration(prtouch_result)
 
     cmd_PRTOUCH_ACCURACY_help = 'Probe Z-height accuracy at sensor position.'
