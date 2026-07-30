@@ -858,12 +858,17 @@ class PRTouchZOffsetWrapper:
 
         probe_gcmd = self.obj.gcode.create_gcode_command('PROBE', 'PROBE', {'SAMPLES': self.cfg.probe_sample_count})
         z_probe = probe.run_single_probe(self.obj.probe, probe_gcmd)
-        self._log_info('Probe at sensor: %.3f' % z_probe[2])
+
+        # New Klipper returns probe position with z_offset already subtracted.
+        # Restore the raw probe position.
+        z_probe_z = z_probe[2] + start_z_offset
+
+        self._log_info('Probe at sensor: %.3f' % z_probe_z)
 
         nozzle_z_offset = self.probe_z_offset(x, y)
         self._log_info('Nozzle z_offset: %.3f' % nozzle_z_offset)
 
-        z_offset = nozzle_z_offset - z_probe[2]
+        z_offset = nozzle_z_offset - z_probe_z
         self._log_info('Calculated z_offset: %.3f' % z_offset)
 
         z_adjust = start_z_offset - z_offset
@@ -872,9 +877,17 @@ class PRTouchZOffsetWrapper:
         if gcmd.get_int('APPLY_Z_ADJUST', 0) == 1:
             self.obj.gcode.run_script_from_command('SET_GCODE_OFFSET Z_ADJUST=%f MOVE=1' % z_adjust)
 
-        prtouch_result = list(z_probe)
-        prtouch_result[2] = -z_adjust
-        self._finalize_probe_calibration(prtouch_result)
+        new_z_offset = z_adjust
+
+        self.obj.gcode.respond_info(
+            "%s: z_offset: %.3f\n"
+            "The SAVE_CONFIG command will update the printer config file\n"
+            "with the above and restart the printer."
+            % (self.cfg.probe_name, new_z_offset)
+        )
+
+        configfile = self.obj.printer.lookup_object("configfile")
+        configfile.set(self.cfg.probe_name, "z_offset", "%.3f" % new_z_offset)
 
     cmd_PRTOUCH_ACCURACY_help = 'Probe Z-height accuracy at sensor position.'
 
