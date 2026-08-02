@@ -348,17 +348,6 @@ class PRTouchZOffsetWrapper:
         stddev = statistics.pstdev(recent) if len(recent) > 1 else 0.0
         return avg, stddev
 
-    def _derivative(self, vals: List[float]) -> List[float]:
-        if len(vals) < 2:
-            return []
-        return [vals[i] - vals[i - 1] for i in range(1, len(vals))]
-
-    def _second_derivative(self, vals: List[float]) -> List[float]:
-        der = self._derivative(vals)
-        if len(der) < 2:
-            return []
-        return [der[i] - der[i - 1] for i in range(1, len(der))]
-
     def _remove_spikes(self, vals: List[float], max_hold: int) -> List[float]:
         """Replace isolated spikes above *max_hold* with the previous value."""
         result = list(vals)
@@ -426,13 +415,8 @@ class PRTouchZOffsetWrapper:
             for i in range(min_idx, window):
                 cleaned[i] = cleaned[i] * k + cleaned[i - 1] * (1 - k)
 
-        # Monotone rising tail check: require a sustained rising slope near the end.
+        # Monotone rising tail check
         if not all(cleaned[-i] > cleaned[-i - 1] for i in range(1, min(5, window))):
-            return False
-
-        # Second derivative check: exclude плавный рост из-за прогиба.
-        sec_deriv = self._second_derivative(cleaned)
-        if len(sec_deriv) >= 2 and max(sec_deriv[-3:]) < max(1.5 * noise, min_hold * 0.05):
             return False
 
         # Tail must exceed all earlier values by a noise-aware margin
