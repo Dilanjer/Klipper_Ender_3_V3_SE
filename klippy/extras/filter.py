@@ -18,10 +18,10 @@ class RCTFilter:
         out_vals = []
         if len(vals) < 3:
             return vals
-        for i in range(len(vals) - 2):
-            window = [vals[i], vals[i + 1], vals[i + 2]]
-            window.sort()
-            out_vals.append(window[1])
+        for i in range(len(vals) - 2):   
+            tmp = [math.fabs(vals[i]), math.fabs(vals[i + 1]), math.fabs(vals[i + 2])]
+            index = tmp.index(min(tmp))
+            out_vals.append(vals[index + i])
         out_vals.append(vals[-2])
         out_vals.append(vals[-1])
         return out_vals
