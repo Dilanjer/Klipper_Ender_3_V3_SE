@@ -330,6 +330,35 @@ class PRTouchZOffsetWrapper:
         spread = (max_val - min_val) or 1.0
         return [(v - min_val) / spread for v in vals]
 
+    def _median(self, vals: List[float]) -> float:
+        if not vals:
+            return 0.0
+        sorted_vals = sorted(vals)
+        mid = len(sorted_vals) // 2
+        if len(sorted_vals) % 2:
+            return sorted_vals[mid]
+        return 0.5 * (sorted_vals[mid - 1] + sorted_vals[mid])
+
+    def _baseline_stats(self, vals: List[float], window: int = 8) -> Tuple[float, float]:
+        if not vals:
+            return 0.0, 0.0
+        window = min(len(vals), window)
+        recent = vals[-window:]
+        avg = statistics.mean(recent)
+        stddev = statistics.pstdev(recent) if len(recent) > 1 else 0.0
+        return avg, stddev
+
+    def _derivative(self, vals: List[float]) -> List[float]:
+        if len(vals) < 2:
+            return []
+        return [vals[i] - vals[i - 1] for i in range(1, len(vals))]
+
+    def _second_derivative(self, vals: List[float]) -> List[float]:
+        der = self._derivative(vals)
+        if len(der) < 2:
+            return []
+        return [der[i] - der[i - 1] for i in range(1, len(der))]
+
     def _remove_spikes(self, vals: List[float], max_hold: int) -> List[float]:
         """Replace isolated spikes above *max_hold* with the previous value."""
         result = list(vals)
@@ -384,6 +413,9 @@ class PRTouchZOffsetWrapper:
 
         cleaned = self._remove_spikes(fit_vals, max_hold)
 
+        baseline, noise = self._baseline_stats(_unfit_vals, max(4, window // 4))
+        expected_trigger = max(min_hold, baseline + max(3.0 * noise, min_hold * 0.2))
+
         # Detrend and find minimum index
         norm_rotated, min_idx = self._rotate_by_trend(self._normalize(cleaned))
         self.val.out_index = min_idx
@@ -394,13 +426,18 @@ class PRTouchZOffsetWrapper:
             for i in range(min_idx, window):
                 cleaned[i] = cleaned[i] * k + cleaned[i - 1] * (1 - k)
 
-        # Monotone rising tail check
-        if not (cleaned[-1] > cleaned[-2] > cleaned[-3]):
+        # Monotone rising tail check: require a sustained rising slope near the end.
+        if not all(cleaned[-i] > cleaned[-i - 1] for i in range(1, min(5, window))):
             return False
 
-        # Tail must exceed all earlier values
+        # Second derivative check: exclude плавный рост из-за прогиба.
+        sec_deriv = self._second_derivative(cleaned)
+        if len(sec_deriv) >= 2 and max(sec_deriv[-3:]) < max(1.5 * noise, min_hold * 0.05):
+            return False
+
+        # Tail must exceed all earlier values by a noise-aware margin
         tail_max = max(cleaned[-1], cleaned[-2], cleaned[-3])
-        if tail_max <= max(cleaned[: window - 3]):
+        if tail_max <= max(cleaned[: window - 3]) + max(2.0 * noise, min_hold * 0.1):
             return False
 
         # Slope uniformity check on normalised values
@@ -409,8 +446,12 @@ class PRTouchZOffsetWrapper:
             if (norm[-1] - norm[i]) / ((window - i) / window) < TRIGGER_SLOPE_THRESHOLD:
                 return False
 
-        # Absolute hold thresholds
-        if fit_vals[-1] < min_hold or fit_vals[-2] < (min_hold / 2) or fit_vals[-3] < (min_hold / 3):
+        # Absolute hold thresholds relative to baseline/noise
+        if (
+            cleaned[-1] < expected_trigger
+            or cleaned[-2] < (expected_trigger / 2)
+            or cleaned[-3] < (expected_trigger / 3)
+        ):
             return False
 
         if self.cfg.show_msg:
@@ -502,6 +543,7 @@ class PRTouchZOffsetWrapper:
             % (rdy_pos[0], rdy_pos[1], rdy_pos[2], speed_mm, step_us, step_cnt)
         )
 
+        probe_end = False
         while self._is_system_ok():
             self.obj.hx711s.send_heart_beat()
             self.obj.dirzctl.send_heart_beat()
@@ -517,6 +559,9 @@ class PRTouchZOffsetWrapper:
             _fit_vals, tmp_fit_vals = self.obj.filter.cal_filter_by_vals(
                 self.obj.hx711s.s_count, all_valss, self.obj.filter.hft_hz, self.obj.filter.lft_k1, self.cfg.filter_window
             )
+
+            if len(self.obj.dirzctl.all_params) == 2:
+                probe_end = True
 
             for i in range(self.obj.hx711s.s_count):
                 if not self._detect_trigger(i, tmp_fit_vals[i], tmp_unfit_vals[i], min_hold, max_hold):
@@ -543,6 +588,10 @@ class PRTouchZOffsetWrapper:
                 if up_after:
                     self.obj.dirzctl.check_and_run(1, step_us // 2, up_all_cnt)
                 return self.val.out_index, self.val.out_val_mm, deal_sta
+
+            if probe_end:
+                self._log_info('Probe ended without trigger detection, aborting probe step')
+                return self.val.out_index, self.val.out_val_mm, False
 
             self.obj.hx711s.delay_s(HX711_STATUS_POLL_SEC)
 
