@@ -883,7 +883,7 @@ inherits them from the specified `primary_carriage`, thus sharing
 the same range of motion with the primary carriage.
 
 For the references on how to configure IDEX setups, see the
-[dual carriage](#dual-carriage) section.
+[dual carriage](#dual_carriage) section.
 
 ### None Kinematics
 
@@ -1757,7 +1757,7 @@ Enables support to exclude or cancel individual objects during the printing
 process.
 
 See the [exclude objects guide](Exclude_Object.md) and
-[command reference](G-Codes.md#excludeobject)
+[command reference](G-Codes.md#exclude_object)
 for additional information. See the
 [sample-macros.cfg](../config/sample-macros.cfg) file for a
 Marlin/RepRapFirmware compatible M486 G-Code macro.
@@ -2559,7 +2559,7 @@ position_max:
 #homing_positive_dir:
 ...
 ```
-Refer to [generic cartesian](#generic-cartesian) section for more information
+Refer to [generic cartesian](#generic-cartesian-kinematics) section for more information
 on the regular `carriage` parameters.
 
 Then a user must define one or more stepper motors moving the dual carriage
@@ -4650,6 +4650,19 @@ d7_pin:
 #   Set the number of characters per line for an hd44780 type lcd.
 #   Possible values are 20 (default) and 16. The number of lines is
 #   fixed to 4.
+#hd44780_delay: 0.000040
+#   The minimum time (in seconds) to wait after sending a command
+#   or data byte to the hd44780 chip. Some displays (typically ones
+#   with a slower internal oscillator) need more time than the
+#   default and will show wrong or randomly changing characters.
+#   Only change this if that occurs. In that case, increase the value
+#   in steps of 0.000001 (1us) and check the display over a longer
+#   period (eg, a full print) at each step, as the errors may only
+#   appear sporadically. Once the display is reliable, add a small
+#   margin (a few microseconds) as the display timing can vary with
+#   temperature. Use the lowest reliable value, as the
+#   micro-controller waits for this delay between every byte sent to
+#   the display. The maximum is 0.000060. The default is 0.000040.
 ...
 ```
 
@@ -5173,6 +5186,31 @@ sensor_type:
 #   The default is 'normal'. Use 'inverted' if the sensor reports a
 #   decreasing force value when placed under load.
 ```
+
+#### CS1237
+
+The CS1237 sensor backend supports both `[load_cell]` and
+`[load_cell_probe]`.
+
+```
+[load_cell my_cs1237]
+sensor_type: cs1237
+sclk_pin:
+#   The pin connected to the CS1237 clock line. This parameter must be
+#   provided.
+dout_pin:
+#   The pin connected to the bidirectional CS1237 DOUT line. This parameter
+#   must be provided.
+#sample_rate: 640
+#   Valid values for sample_rate are 10, 40, 640, or 1280. The default is 640.
+#gain: 128
+#   Valid values for gain are 1, 2, 64, or 128. The default is 128.
+#reference_output: True
+#   Enable the CS1237 REFO reference output. The default is True.
+```
+
+Both pins must be on the same MCU. DOUT is bidirectional during
+configuration.
 
 #### HX711
 This is a 24 bit low sample rate chip using "bit-bang" communications. It is
