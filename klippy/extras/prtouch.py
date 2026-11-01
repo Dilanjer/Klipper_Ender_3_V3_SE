@@ -9,7 +9,6 @@ import logging
 import math
 import random
 import statistics
-import time
 from typing import Any, List, Optional, Tuple
 
 from . import probe
@@ -23,6 +22,8 @@ logger = logging.getLogger(__name__)
 # Timing
 HX711_CAPTURE_DELAY_SEC = 0.015
 HX711_STATUS_POLL_SEC = 0.005
+PROBE_DEADLINE_MARGIN_SEC = 3.0
+TEMP_WAIT_TIMEOUT_SEC = 600.0
 
 # Motion
 PROBE_RETRY_Z_INCREMENT_MM = 2.0
@@ -60,6 +61,12 @@ class PRTouchCFG:
         self.z_offset_samples_speed = config.getfloat('z_offset_samples_speed', default=2.5, minval=0.1, maxval=10)
         self.bed_max_err = config.getint('bed_max_err', default=4, minval=2, maxval=10)
         self.check_bed_mesh_max_err = config.getfloat('check_bed_mesh_max_err', default=0.2, minval=0.01, maxval=1)
+        # Systematic correction (mm) ADDED to the computed/saved probe z_offset.
+        # Calibrate once against a trusted reference (e.g. paper test).
+        self.z_offset_correction = config.getfloat('z_offset_correction', default=0.0, minval=-1.0, maxval=1.0)
+        # Max depth (mm) below Z=0 the nozzle may descend while probing. Limits how hard
+        # the nozzle can push into the bed if the trigger is never detected.
+        self.probe_max_depth_mm = config.getfloat('probe_max_depth_mm', default=2.0, minval=0.5, maxval=10.0)
 
         # Probe motion speeds
         self.probe_xy_travel_speed = config.getfloat('probe_xy_travel_speed', default=150, minval=60, maxval=250)
@@ -208,6 +215,9 @@ class PRTouchZOffsetWrapper:
             and not self.obj.dirzctl.is_timeout
         )
 
+    def _now(self) -> float:
+        return self.obj.printer.get_reactor().monotonic()
+
     def _ensure_homed(self) -> None:
         """Run a full home if any axis reports as unhomed."""
         if self.obj.kin is None:
@@ -298,22 +308,32 @@ class PRTouchZOffsetWrapper:
         self,
         heater: Any,
         target_temp: float,
-        err_tolerance: float = 5.0
+        err_tolerance: float = 5.0,
+        cooling: bool = False,
+        timeout_sec: float = TEMP_WAIT_TIMEOUT_SEC,
     ) -> bool:
-        """Poll *heater* until it reaches *target_temp*."""
+        """Poll *heater* until it reaches *target_temp*; False on timeout/fault.
 
+        When *cooling* is set, any temperature at or below target+tolerance counts
+        (so a window that was overshot downwards cannot hang the loop).
+        """
         poll_interval = self.cfg.nozzle_clean_temp_poll_interval_sec
+        deadline = self._now() + timeout_sec
 
         while self._is_system_ok():
-            if (
-                abs(target_temp - heater.smoothed_temp) <= err_tolerance
-                and heater.target_temp > 0
-            ):
+            if cooling:
+                reached = heater.smoothed_temp <= target_temp + err_tolerance
+            else:
+                reached = abs(target_temp - heater.smoothed_temp) <= err_tolerance
+            if reached and heater.target_temp > 0:
                 self._log_info(
                     'Temperature reached: %.1f°C ≈ %.1f°C'
                     % (heater.smoothed_temp, target_temp)
                 )
                 return True
+            if self._now() > deadline:
+                self._log_info('Temperature wait timeout (%.0fs) for %.1f°C' % (timeout_sec, target_temp))
+                return False
 
             self.obj.hx711s.delay_s(poll_interval)
 
@@ -430,6 +450,8 @@ class PRTouchZOffsetWrapper:
             raise self.obj.printer.command_error(
                 '{"code":"key502", "msg":"probe_by_step: Can not recv stepper-z status."}'
             )
+        # Work on copies: the originals stay untouched (raw MCU ticks)
+        dirzctl_params = [dict(p) for p in dirzctl_params]
 
         up_all_cnt = dirzctl_params[0]['step'] - dirzctl_params[1]['step'] + 1
         if len(hx711_vals) < self.cfg.filter_window or len(hx711_params) < self.cfg.filter_window:
@@ -489,9 +511,10 @@ class PRTouchZOffsetWrapper:
         """Descend, detect trigger, and optionally retract."""
         self.obj.hx711s.read_base(self.cfg.tare_samples // 2, max_hold)
 
+        min_dis_mm = min(min_dis_mm, rdy_pos[2] + self.cfg.probe_max_depth_mm)
         step_dist = self.obj.dirzctl.steppers[0].get_step_dist() * self.obj.dirzctl.step_base
-        step_cnt = int(min_dis_mm / step_dist)
-        step_us = int((min_dis_mm / speed_mm * 1_000_000) / step_cnt)
+        step_cnt = max(1, int(min_dis_mm / step_dist))
+        step_us = max(1, int((min_dis_mm / speed_mm * 1_000_000) / step_cnt))
 
         self.obj.hx711s.query_start(self.cfg.filter_window * 2, 65535, del_dirty=True, show_msg=False, is_ck_con=True)
         self.obj.dirzctl.check_and_run(0, step_us, step_cnt, wait_finish=False, is_ck_con=True)
@@ -502,7 +525,16 @@ class PRTouchZOffsetWrapper:
             % (rdy_pos[0], rdy_pos[1], rdy_pos[2], speed_mm, step_us, step_cnt)
         )
 
+        # Safety net: the descent itself takes min_dis_mm/speed_mm seconds
+        deadline = self._now() + (min_dis_mm / speed_mm) * 1.5 + PROBE_DEADLINE_MARGIN_SEC
+
         while self._is_system_ok():
+            if self._now() > deadline:
+                self.obj.dirzctl.check_and_run(0, 0, 0, wait_finish=False)
+                self.obj.hx711s.query_start(self.cfg.filter_window * 2, 0, del_dirty=False, show_msg=False)
+                raise self.obj.printer.command_error(
+                    '{"code":"key504", "msg":"probe_by_step: probe timeout, no trigger and no stepper-z status."}'
+                )
             self.obj.hx711s.send_heart_beat()
             self.obj.dirzctl.send_heart_beat()
             all_valss = self.obj.hx711s.get_vals()
@@ -546,7 +578,8 @@ class PRTouchZOffsetWrapper:
 
             self.obj.hx711s.delay_s(HX711_STATUS_POLL_SEC)
 
-        return self.val.out_index, self.val.out_val_mm, True
+        # Left the loop because of a MCU fault/shutdown: not a valid measurement
+        return self.val.out_index, self.val.out_val_mm, False
 
     def _measure_probe_position(
         self,
@@ -577,7 +610,11 @@ class PRTouchZOffsetWrapper:
                     rdy_pos[:2] + [retry_z], speed_mm, min_dis_mm, min_hold, max_hold, True
                 )
                 if not success:
-                    retry_z = retry_z + PROBE_RETRY_Z_INCREMENT_MM if retry_z == rdy_pos[2] else retry_z
+                    if retry_z == rdy_pos[2]:
+                        retry_z += PROBE_RETRY_Z_INCREMENT_MM
+                        # _probe_step uses retry_z as the start height of the descent,
+                        # so the nozzle must really be there before the next attempt
+                        self._execute_move(rdy_pos[:2] + [retry_z], self.cfg.probe_approach_speed)
                     retry_needed = True
                     break
                 probe_results.append(measured_z)
@@ -722,7 +759,7 @@ class PRTouchZOffsetWrapper:
         self._log_info('=== Phase 4: Cooling ===')
         try:
             self._set_nozzle_temperature(temp=target_temp, fan_spd=self.cfg.nozzle_clean_cool_fan_speed)
-            if not self._wait_for_temperature(self.obj.heater_hot, target_temp):
+            if not self._wait_for_temperature(self.obj.heater_hot, target_temp, cooling=True):
                 self._log_info('Cooling timeout: nozzle did not cool to %.1f°C' % target_temp)
                 return False
             self._log_info('Nozzle cooled to %.1f°C' % target_temp)
@@ -743,8 +780,8 @@ class PRTouchZOffsetWrapper:
         bed_max_temp: float,
         min_hold: int,
         max_hold: int,
-    ) -> None:
-        """Execute the complete 4-phase nozzle cleaning procedure."""
+    ) -> bool:
+        """Execute the complete 4-phase nozzle cleaning procedure; True on success."""
         try:
             self._log_info('========== NOZZLE CLEANING START ==========')
             self._log_info(
@@ -761,29 +798,31 @@ class PRTouchZOffsetWrapper:
             self._set_nozzle_temperature(temp=nozzle_clean_min_temp, fan_spd=NOZZLE_CLEAR_FAN_SPEED_OFF)
             if not self._wait_for_temperature(self.obj.heater_hot, nozzle_clean_min_temp):
                 self._log_info('Failed to preheat nozzle — aborting')
-                return
+                return False
 
             z_start, z_end, status = self._phase_pre_measurement(min_hold, max_hold)
             if status != CLEAN_STATUS_OK:
                 self._log_info('Pre-measurement failed (status=%d) — aborting' % status)
-                return
+                return False
             self._log_info('Pre-measurement: start=%.3f, end=%.3f' % (z_start, z_end))
 
             if not self._phase_preparation(self.cfg.nozzle_clean_main_temp):
                 self._log_info('Preparation phase failed — aborting')
-                return
+                return False
 
             if not self._phase_cleaning_execution():
                 self._log_info('Cleaning execution failed — aborting')
-                return
+                return False
 
             if not self._phase_cooling(self.cfg.nozzle_clean_cool_target_temp):
                 self._log_info('Cooling phase completed with warnings')
 
             self._log_info('========== NOZZLE CLEANING COMPLETE ==========')
+            return True
         except Exception as exc:
             import traceback
             self._log_info('CRITICAL ERROR in clear_nozzle: %s\n%s' % (exc, traceback.format_exc()))
+            return False
 
     def probe_z_offset(self, x: float, y: float) -> float:
         """Return the Z-offset measured at (x, y)."""
@@ -817,13 +856,15 @@ class PRTouchZOffsetWrapper:
     cmd_NOZZLE_CLEAR_help = 'Clear the nozzle on bed.'
 
     def cmd_NOZZLE_CLEAR(self, gcmd: Any) -> None:
-        self.clear_nozzle(
+        ok = self.clear_nozzle(
             nozzle_clean_min_temp=gcmd.get_float('nozzle_clean_min_temp', self.cfg.nozzle_clean_min_temp),
             nozzle_clean_max_temp=gcmd.get_float('nozzle_clean_max_temp', self.cfg.nozzle_clean_max_temp),
             bed_max_temp=gcmd.get_float('BED_MAX_TEMP', self.cfg.bed_max_temp),
             min_hold=gcmd.get_int('MIN_HOLD', self.cfg.min_hold),
             max_hold=gcmd.get_int('MAX_HOLD', self.cfg.max_hold),
         )
+        if not ok:
+            raise gcmd.error('NOZZLE_CLEAR failed, see klippy.log for details')
 
     cmd_PRTOUCH_PROBE_ZOFFSET_help = 'Probe the z-offset.'
 
@@ -837,13 +878,14 @@ class PRTouchZOffsetWrapper:
         self._log_info('Start z_offset: %.3f' % start_z_offset)
 
         if gcmd.get_int('CLEAR_NOZZLE', 0) == 1:
-            self.clear_nozzle(
+            if not self.clear_nozzle(
                 self.cfg.nozzle_clean_min_temp,
                 self.cfg.nozzle_clean_max_temp,
                 self.cfg.bed_max_temp,
                 self.cfg.min_hold,
                 self.cfg.max_hold,
-            )
+            ):
+                gcmd.respond_info('WARNING: nozzle cleaning failed, a dirty nozzle biases the z_offset')
 
         self._ensure_homed()
 
@@ -866,8 +908,8 @@ class PRTouchZOffsetWrapper:
         z_offset = nozzle_z_offset - z_probe[2]
         self._log_info('Calculated z_offset: %.3f' % z_offset)
 
-        z_adjust = start_z_offset - z_offset
-        self._log_info('z_adjust: %.3f' % z_adjust)
+        z_adjust = start_z_offset - z_offset + self.cfg.z_offset_correction
+        self._log_info('z_adjust: %.3f (correction %.3f)' % (z_adjust, self.cfg.z_offset_correction))
 
         if gcmd.get_int('APPLY_Z_ADJUST', 0) == 1:
             self.obj.gcode.run_script_from_command('SET_GCODE_OFFSET Z_ADJUST=%f MOVE=1' % z_adjust)
@@ -893,6 +935,8 @@ class PRTouchZOffsetWrapper:
         positions: List[float] = []
         while len(positions) < sample_count:
             _index, pos, _sta = self._probe_step(sensor_pos, speed, 10, self.cfg.min_hold, self.cfg.max_hold, True)
+            if not self._is_system_ok():
+                raise gcmd.error('PRTOUCH_ACCURACY aborted: MCU fault')
             positions.append(pos)
             gcmd.respond_info('probe #%d at (%.3f, %.3f): %.3f' % (len(positions), sensor_pos[0], sensor_pos[1], pos))
 
